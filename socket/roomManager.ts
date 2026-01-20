@@ -45,6 +45,10 @@ export class RoomManager {
         const roomData = this.safeParse<RoomData>(data);
         if (!roomData) return null;
 
+        // Sync players between room wrapper and game state
+        // Redis data is parsed into separate objects, but logic expects them to be linked
+        roomData.gameState.players = roomData.players;
+
         const deck = Deck.fromState(roomData.deckState);
         return { room: roomData, deck };
     }
