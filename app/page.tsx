@@ -13,6 +13,8 @@ export default function Home() {
   const [error, setError] = useState("");
   const [maxPlayers, setMaxPlayers] = useState(2);
   const [queueStatus, setQueueStatus] = useState<{ size: number, current: number } | null>(null);
+  const [isWakingUp, setIsWakingUp] = useState(false);
+  const [backendActive, setBackendActive] = useState(false);
 
   useEffect(() => {
     if (!socket) return;
@@ -47,6 +49,25 @@ export default function Home() {
       socket.off("error");
     };
   }, [socket]);
+
+  const activateBackend = async () => {
+    setIsWakingUp(true);
+    const socketUrl = process.env.NEXT_PUBLIC_SOCKET_URL || "http://localhost:3000";
+    try {
+      const res = await fetch(socketUrl);
+      if (res.ok) {
+        setBackendActive(true);
+        alert("Backend is active!");
+      } else {
+        alert("Backend reachable but returned error status.");
+      }
+    } catch (e) {
+      console.error(e);
+      alert("Failed to wake up backend. Please try again.");
+    } finally {
+      setIsWakingUp(false);
+    }
+  };
 
   const createRoom = () => {
     if (!name) return alert("Enter name first");
@@ -121,6 +142,16 @@ export default function Home() {
       <h1 className="text-5xl font-extrabold mb-8 text-transparent bg-clip-text bg-gradient-to-r from-yellow-400 to-orange-500">
         Rummy Multiplayer
       </h1>
+
+      {!backendActive && (
+        <button
+          onClick={activateBackend}
+          disabled={isWakingUp}
+          className="mb-6 px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded-full font-bold text-sm transition-all shadow-lg disabled:opacity-50"
+        >
+          {isWakingUp ? "Waking up Server..." : "🚀 Activate Backend"}
+        </button>
+      )}
 
       {error && <div className="bg-red-500 p-3 rounded mb-4">{error}</div>}
 

@@ -85,6 +85,8 @@ export class RoomManager {
 
         const playerInfo = JSON.stringify({ id: socket.id, name: playerName });
         await redis.rpush(queueKey, playerInfo);
+        // Track queue entry for cleanup on disconnect
+        await redis.set(`queue_ref:${socket.id}`, JSON.stringify({ gameSize, playerInfo }), { ex: 3600 });
         console.log(`Player ${playerName} joined Redis queue ${gameSize}`);
 
         // Check length
@@ -102,6 +104,12 @@ export class RoomManager {
             const playersRaw = await redis.lpop<string[]>(queueKey, gameSize);
             if (playersRaw && playersRaw.length === gameSize) {
                 const players = playersRaw.map(s => (typeof s === 'string' ? JSON.parse(s) : s));
+
+                // Remove queue refs for matched players so we don't try to remove them from queue on disconnect
+                for (const p of players) {
+                    await redis.del(`queue_ref:${p.id}`);
+                }
+
                 const roomId = await this.createRoom(gameSize);
                 console.log(`Match managed via Upstash! Room ${roomId}`);
 
@@ -291,6 +299,16 @@ export class RoomManager {
     }
 
     async handleDisconnect(socket: Socket) {
+        // 1. Check if in Queue and remove
+        const queueRefData = await redis.get<string>(`queue_ref:${socket.id}`);
+        if (queueRefData) {
+            const { gameSize, playerInfo } = JSON.parse(queueRefData);
+            await redis.lrem(`queue:${gameSize}`, 0, playerInfo);
+            await redis.del(`queue_ref:${socket.id}`);
+            console.log(`Removed player from queue ${gameSize} due to disconnect`);
+        }
+
+        // 2. Check if in Room
         const roomId = await redis.get<string>(`socket:${socket.id}`);
         if (!roomId) return;
 
