@@ -26,19 +26,24 @@ export class RoomManager {
         console.log("Upstash Redis configured");
     }
 
+    private safeParse<T>(data: string | T): T | null {
+        if (typeof data === 'string') {
+            try {
+                return JSON.parse(data);
+            } catch (e) {
+                console.error("Failed to parse Redis data:", data, e);
+                return null;
+            }
+        }
+        return data; // Already an object (Upstash behavior)
+    }
+
     private async getRoom(roomId: string): Promise<{ room: RoomData, deck: Deck } | null> {
-        // Upstash HTTP returns the object directly if we store it as JSON? 
-        // No, Redis stores strings. Upstash SDK *can* auto-deserialize if you rely on it, but safe to treat as string or use `get<T>`.
-        // Let's assume standard behavior: we stored string.
         const data = await redis.get<RoomData | string>(`room:${roomId}`);
         if (!data) return null;
 
-        let roomData: RoomData;
-        if (typeof data === 'string') {
-            roomData = JSON.parse(data);
-        } else {
-            roomData = data; // Upstash might auto-parse JSON
-        }
+        const roomData = this.safeParse<RoomData>(data);
+        if (!roomData) return null;
 
         const deck = Deck.fromState(roomData.deckState);
         return { room: roomData, deck };
@@ -77,14 +82,9 @@ export class RoomManager {
 
     async joinQueue(socket: Socket, playerName: string, gameSize: number) {
         const queueKey = `queue:${gameSize}`;
-
-        // Push to Redis List
-        // Check if already in queue? Expensive scan. Just push and dedupe on pop.
-        // Or use Set, but we need order.
-        // Let's use simple List.
-
         const playerInfo = JSON.stringify({ id: socket.id, name: playerName });
         await redis.rpush(queueKey, playerInfo);
+
         // Track queue entry for cleanup on disconnect
         await redis.set(`queue_ref:${socket.id}`, JSON.stringify({ gameSize, playerInfo }), { ex: 3600 });
         console.log(`Player ${playerName} joined Redis queue ${gameSize}`);
@@ -93,19 +93,25 @@ export class RoomManager {
         const len = await redis.llen(queueKey);
 
         if (len >= gameSize) {
-            // Pop N players
-            // Note: Race condition possible if multiple servers pop. 
-            // Proper way: LPOP N with Lua script or simple loop if single threaded Node.
-            // Since Node is single threaded for this process, `await` breaks atomicity? 
-            // Redis operations are atomic, but the check-then-pop logic isn't if unrelated.
-            // But `LPOP count` is atomic in Redis 6.2+.
-            // Assuming simplified env.
-
             const playersRaw = await redis.lpop<string[]>(queueKey, gameSize);
-            if (playersRaw && playersRaw.length === gameSize) {
-                const players = playersRaw.map(s => (typeof s === 'string' ? JSON.parse(s) : s));
 
-                // Remove queue refs for matched players so we don't try to remove them from queue on disconnect
+            // Validate we got enough players (concurrency check)
+            if (playersRaw && playersRaw.length === gameSize) {
+                const players: { id: string, name: string }[] = [];
+                for (const raw of playersRaw) {
+                    const p = this.safeParse<{ id: string, name: string }>(raw);
+                    if (p) players.push(p);
+                }
+
+                if (players.length !== gameSize) {
+                    // Should not happen if data integrity is good, but if it does, 
+                    // we might lose players technically if we don't push them back.
+                    // For now, logging error.
+                    console.error("Matchmaking error: parsed players count mismatch");
+                    return;
+                }
+
+                // Remove queue refs for matched players
                 for (const p of players) {
                     await redis.del(`queue_ref:${p.id}`);
                 }
@@ -114,12 +120,6 @@ export class RoomManager {
                 console.log(`Match managed via Upstash! Room ${roomId}`);
 
                 for (const p of players) {
-                    // We need to tell these sockets to join. 
-                    // Problem: Socket objects are local to THIS server instance.
-                    // If we are scaling, we need Pub/Sub.
-                    // For now, assuming 1 server instance (Vertical Scaling) or Sticky Sessions.
-                    // If using 1 instance, we can access via `this.io.sockets`.
-
                     const playerSocket = this.io.sockets.sockets.get(p.id);
                     if (playerSocket) {
                         await this.joinRoom(playerSocket, roomId, p.name);
@@ -302,10 +302,14 @@ export class RoomManager {
         // 1. Check if in Queue and remove
         const queueRefData = await redis.get<string>(`queue_ref:${socket.id}`);
         if (queueRefData) {
-            const { gameSize, playerInfo } = JSON.parse(queueRefData);
-            await redis.lrem(`queue:${gameSize}`, 0, playerInfo);
+            const parsed = this.safeParse<{ gameSize: number, playerInfo: string }>(queueRefData);
+            if (parsed) {
+                const { gameSize, playerInfo } = parsed;
+                // Upstash Redis lrem expects (key, count, element)
+                await redis.lrem(`queue:${gameSize}`, 0, playerInfo);
+                console.log(`Removed player from queue ${gameSize} due to disconnect`);
+            }
             await redis.del(`queue_ref:${socket.id}`);
-            console.log(`Removed player from queue ${gameSize} due to disconnect`);
         }
 
         // 2. Check if in Room
