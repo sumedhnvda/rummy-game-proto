@@ -185,7 +185,28 @@ export class RoomManager {
         if (!data) return;
         const { room, deck } = data;
 
+        // Idempotency: Don't restart if already playing
+        if (room.gameState.status === 'playing') {
+            // Re-emit state to recovering client just in case
+            this.io.to(roomId).emit('game-started', room.gameState);
+            return;
+        }
+
         if (room.players.length < 2) return;
+
+        console.log(`Starting game ${roomId}. Deck count: ${deck.count}`);
+
+        // FAIL-SAFE: If deck is somehow empty or insufficient, regenerate it
+        if (deck.count < (room.players.length * 13)) {
+            console.warn(`Deck insufficient (${deck.count}) for room ${roomId}. Regenerating...`);
+            // Create a fresh deck logic (calling private initialize via public method or new instance)
+            // Hacky but effective: re-instantiate or expose reset. 
+            // Since initialize is private, we can just making a new Deck and stealing its cards.
+            const tempDeck = new Deck(2, 2);
+            tempDeck.shuffle();
+            deck.cards = tempDeck.cards;
+            console.log(`Regenerated deck. New count: ${deck.count}`);
+        }
 
         room.gameState.status = 'playing';
 

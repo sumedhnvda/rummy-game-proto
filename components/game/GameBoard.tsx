@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { Socket } from "socket.io-client";
 import { GameState, Card as CardType } from "@/lib/game/types";
 import { Card } from "./Card";
 import { HowToPlayModal } from "./HowToPlayModal";
 import clsx from "clsx";
+import { motion, AnimatePresence } from "framer-motion";
 
 interface GameBoardProps {
     socket: Socket;
@@ -14,9 +15,74 @@ interface GameBoardProps {
 export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
     const me = gameState.players.find(p => p.id === playerId);
     const opponents = gameState.players.filter(p => p.id !== playerId);
+
+    // Local Hand State for Fluid Dragging
+    const [localHand, setLocalHand] = useState<CardType[]>([]);
+    const [isDragging, setIsDragging] = useState(false);
+
     const [selectedCards, setSelectedCards] = useState<string[]>([]);
     const [actionError, setActionError] = useState("");
     const [winData, setWinData] = useState<{ winnerId: string, reason: string } | null>(null);
+
+    // Animation State
+    const [drawnCard, setDrawnCard] = useState<CardType | null>(null);
+    const [showDrawAnim, setShowDrawAnim] = useState(false);
+    const [isRevealing, setIsRevealing] = useState(false);
+    // FIX: Initialize with current hand length to prevent animation on first render
+    const prevHandLength = useRef<number>(me ? me.hand.length : 0);
+
+    // Sync local hand with game state strictly when not dragging
+    useEffect(() => {
+        if (!me) return;
+
+        if (!isDragging) {
+            setLocalHand(me.hand);
+        }
+
+        // Detect Draw for Animation (Optimistic Reveal)
+        if (me.hand.length > prevHandLength.current && me.isMyTurn) {
+            const newCard = me.hand[me.hand.length - 1]; // Assume appended
+
+            // If we already started animation (from click)
+            if (showDrawAnim) {
+                // Case 1: Mystery Card (Deck) - Wait, Reveal, then Close
+                if (!drawnCard && newCard) {
+                    setTimeout(() => {
+                        setDrawnCard(newCard); // Reveal
+                        setIsRevealing(true);
+                        // Auto-hide animation after delay
+                        setTimeout(() => {
+                            setShowDrawAnim(false);
+                            setDrawnCard(null);
+                            setIsRevealing(false);
+                        }, 1500);
+                    }, 500);
+                }
+                // Case 2: Known Card (Discard) - Just Close after delay
+                else {
+                    setTimeout(() => {
+                        setShowDrawAnim(false);
+                        setDrawnCard(null);
+                        setIsRevealing(false);
+                    }, 1500);
+                }
+            }
+            // Case 3: Passive/Fallback (Animation missed or not triggered by click)
+            else if (!showDrawAnim) {
+                const oldIds = new Set(localHand.map(c => c.id));
+                const foundCard = me.hand.find(c => !oldIds.has(c.id));
+                if (foundCard) {
+                    setDrawnCard(foundCard);
+                    setShowDrawAnim(true);
+                    setTimeout(() => {
+                        setShowDrawAnim(false);
+                        setDrawnCard(null);
+                    }, 2000);
+                }
+            }
+        }
+        prevHandLength.current = me.hand.length;
+    }, [gameState, me?.hand, isDragging]);
 
     useEffect(() => {
         socket.on("game-ended", (data) => {
@@ -27,8 +93,6 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
 
     const handleLeave = () => {
         if (confirm("Are you sure you want to leave? You will lose.")) {
-            // Socket disconnect will handle specific logic, or we emit explicit "leave-room"
-            // For now, simple disconnect simulation or reload
             window.location.reload();
         }
     };
@@ -47,6 +111,17 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
 
     const handleDraw = (fromDiscard: boolean) => {
         if (!me?.isMyTurn) return;
+
+        // Optimistic Animation
+        if (fromDiscard && gameState.discardPile.length > 0) {
+            setDrawnCard(gameState.discardPile[gameState.discardPile.length - 1]);
+            setIsRevealing(true);
+        } else {
+            setDrawnCard(null); // Unknown -> Back
+            setIsRevealing(false);
+        }
+        setShowDrawAnim(true);
+
         socket.emit("draw-card", { roomId: gameState.roomId, fromDiscard });
     };
 
@@ -61,7 +136,65 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
         setSelectedCards([]);
     };
 
-    if (!me) return <div>Loading...</div>;
+    // --- Drag & Drop Logic ---
+    const dragItem = useRef<number | null>(null);
+    const dragOverItem = useRef<number | null>(null);
+
+    const handleDragStart = (e: React.DragEvent, position: number, cardId: string) => {
+        dragItem.current = position;
+        setIsDragging(true);
+        e.dataTransfer.setData("text/plain", cardId);
+        e.dataTransfer.effectAllowed = "move";
+    };
+
+    const handleDragEnter = (e: React.DragEvent, position: number) => {
+        dragOverItem.current = position;
+
+        if (dragItem.current !== null && dragItem.current !== dragOverItem.current) {
+            const newHand = [...localHand];
+            const draggedContent = newHand[dragItem.current];
+            newHand.splice(dragItem.current, 1);
+            newHand.splice(dragOverItem.current, 0, draggedContent);
+
+            dragItem.current = dragOverItem.current; // Update drag index to new spot
+            setLocalHand(newHand);
+        }
+    };
+
+    const handleDragEnd = () => {
+        setIsDragging(false);
+        dragItem.current = null;
+        dragOverItem.current = null;
+
+        // Emit new order to server
+        if (me) {
+            socket.emit("rearrange-hand", {
+                roomId: gameState.roomId,
+                newOrderIds: localHand.map(c => c.id)
+            });
+        }
+    };
+
+
+    if (!me) {
+        return (
+            <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-900 to-black text-white p-4">
+                <div className="text-center animate-pulse">
+                    <div className="w-16 h-16 border-4 border-yellow-400 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+                    <h2 className="text-2xl font-bold mb-2">Connecting to Game...</h2>
+                    <p className="text-gray-400 mb-8 max-w-md">
+                        We are syncing your game state. If this takes too long, your session might have expired.
+                    </p>
+                    <button
+                        onClick={() => window.location.reload()}
+                        className="px-6 py-2 bg-red-600 hover:bg-red-700 rounded-full font-bold transition-transform active:scale-95"
+                    >
+                        Return to Lobby
+                    </button>
+                </div>
+            </div>
+        );
+    }
 
     if (winData || gameState.status === 'ended') {
         const iWon = winData?.winnerId === me.id || gameState.winner === me.id;
@@ -87,6 +220,41 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
     return (
         <div className="flex flex-col h-screen bg-green-800 p-4 text-white overflow-hidden relative">
             <HowToPlayModal />
+
+            <AnimatePresence>
+                {showDrawAnim && (
+                    <motion.div
+                        initial={{ opacity: 0, scale: 0.5, y: -200 }}
+                        animate={{ opacity: 1, scale: 1.5, y: 0, rotateY: isRevealing ? 360 : 0 }}
+                        exit={{ opacity: 0, scale: 0.2, y: 400, transition: { duration: 0.5 } }}
+                        transition={{ duration: 0.8, type: "spring" }}
+                        className="absolute inset-0 z-50 flex items-center justify-center pointer-events-none"
+                    >
+                        <div className="flex flex-col items-center gap-4">
+                            <motion.div
+                                className="shadow-2xl shadow-yellow-500/50 rounded-xl"
+                                initial={{ rotateY: 0 }}
+                                animate={{ rotateY: isRevealing ? 360 : 0 }}
+                                transition={{ duration: 0.6 }}
+                            >
+                                <div className="transform scale-150">
+                                    {drawnCard ? (
+                                        <Card card={drawnCard} />
+                                    ) : (
+                                        <div className="w-16 h-24 bg-blue-900 border-2 border-white rounded-lg shadow-xl flex items-center justify-center relative">
+                                            <div className="absolute inset-1 border border-blue-700/50 rounded pointer-events-none"></div>
+                                            <span className="font-bold text-xs text-white/50 select-none">RUMMY</span>
+                                        </div>
+                                    )}
+                                </div>
+                            </motion.div>
+                            <span className="text-4xl font-black text-yellow-400 drop-shadow-lg bg-black/50 px-4 py-2 rounded">
+                                {drawnCard ? "DRAWN!" : "DRAWING..."}
+                            </span>
+                        </div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
 
             {actionError && (
                 <div className="absolute top-20 left-1/2 -translate-x-1/2 bg-red-600 text-white px-6 py-2 rounded-full font-bold shadow-xl z-50 animate-bounce">
@@ -128,8 +296,10 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
             {/* Center Table Area */}
             <div className="flex-1 flex items-center justify-center gap-16 relative">
                 {/* Deck */}
-                <div
-                    className={clsx("flex flex-col items-center gap-2 group cursor-pointer transition-transform", me.isMyTurn && me.hand.length === 13 && "hover:scale-105 ring-4 ring-yellow-400/50 rounded-xl")}
+                <motion.div
+                    whileHover={me.isMyTurn && me.hand.length === 13 ? { scale: 1.1 } : {}}
+                    whileTap={me.isMyTurn && me.hand.length === 13 ? { scale: 0.95 } : {}}
+                    className={clsx("flex flex-col items-center gap-2 group cursor-pointer", me.isMyTurn && me.hand.length === 13 && "ring-4 ring-yellow-400/50 rounded-xl")}
                     onClick={() => handleDraw(false)}
                 >
                     <div className="w-24 h-36 bg-blue-900 border-2 border-white rounded-lg shadow-xl flex items-center justify-center relative">
@@ -137,14 +307,34 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
                         <span className="font-bold text-xl select-none">DECK</span>
                     </div>
                     {me.isMyTurn && me.hand.length === 13 && <span className="text-xs bg-yellow-500 text-black px-2 rounded font-bold">CLICK TO DRAW</span>}
-                </div>
+                </motion.div>
 
                 {/* Discard Pile */}
-                <div
-                    className={clsx("flex flex-col items-center gap-2 transition-transform cursor-pointer", me.isMyTurn && me.hand.length === 13 && gameState.discardPile.length > 0 && "hover:scale-105 ring-4 ring-red-400/50 rounded-xl")}
+                <motion.div
+                    whileHover={me.isMyTurn && me.hand.length === 13 && gameState.discardPile.length > 0 ? { scale: 1.1 } : {}}
+                    whileTap={me.isMyTurn && me.hand.length === 13 && gameState.discardPile.length > 0 ? { scale: 0.95 } : {}}
+                    onDragOver={(e) => {
+                        e.preventDefault();
+                        e.currentTarget.style.borderColor = "yellow"; // Basic visual feedback
+                    }}
+                    onDragLeave={(e) => {
+                        e.currentTarget.style.borderColor = "white";
+                    }}
+                    onDrop={(e) => {
+                        e.preventDefault();
+                        e.currentTarget.style.borderColor = "white";
+                        const cardId = e.dataTransfer.getData("text/plain");
+                        if (cardId && me.isMyTurn) {
+                            // If player drops a card here, they want to DISCARD it
+                            // Logic: emit discard
+                            socket.emit("discard-card", { roomId: gameState.roomId, cardId });
+                            setSelectedCards([]); // Clear selection
+                        }
+                    }}
+                    className={clsx("flex flex-col items-center gap-2 cursor-pointer transition-colors", me.isMyTurn && me.hand.length === 13 && gameState.discardPile.length > 0 && "ring-4 ring-red-400/50 rounded-xl")}
                     onClick={() => handleDraw(true)}
                 >
-                    <div className="w-24 h-36 border-2 border-dashed border-white/30 rounded-lg flex items-center justify-center relative bg-white/5">
+                    <div className="w-24 h-36 border-2 border-dashed border-white/30 rounded-lg flex items-center justify-center relative bg-white/5 pointer-events-none">
                         {gameState.discardPile.length > 0 ? (
                             <div className="transform rotate-0">
                                 <Card
@@ -156,7 +346,10 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
                         )}
                     </div>
                     <span className="text-xs font-semibold tracking-widest text-white/70">DISCARD PILE</span>
-                </div>
+                    <span className="text-[10px] text-yellow-400/70 font-mono opacity-0 group-hover:opacity-100 transition-opacity">
+                        DROP HERE TO DISCARD
+                    </span>
+                </motion.div>
             </div>
 
             {/* Bottom: My Hand */}
@@ -180,64 +373,53 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
                 </div>
 
                 <div className="relative h-48 flex justify-center items-end -space-x-8 pb-4 px-4 overflow-x-visible">
-                    {me.hand.map((card, idx) => {
-                        const isSelected = selectedCards.includes(card.id);
-                        return (
-                            <div
-                                key={card.id}
-                                style={{ zIndex: idx }}
-                                draggable
-                                onDragStart={(e) => {
-                                    e.dataTransfer.setData("text/plain", card.id);
-                                }}
-                                onDragOver={(e) => {
-                                    e.preventDefault(); // Allow drop
-                                }}
-                                onDrop={(e) => {
-                                    e.preventDefault();
-                                    const draggedId = e.dataTransfer.getData("text/plain");
-                                    if (draggedId === card.id) return;
-
-                                    const newHand = [...me.hand];
-                                    const fromIdx = newHand.findIndex(c => c.id === draggedId);
-                                    const toIdx = newHand.findIndex(c => c.id === card.id);
-
-                                    if (fromIdx !== -1 && toIdx !== -1) {
-                                        const [movedItem] = newHand.splice(fromIdx, 1);
-                                        newHand.splice(toIdx, 0, movedItem);
-
-                                        // Update local state immediately to avoid flickers
-                                        me.hand = newHand;
-
-                                        socket.emit("rearrange-hand", {
-                                            roomId: gameState.roomId,
-                                            newOrderIds: newHand.map(c => c.id)
-                                        });
-                                    }
-                                }}
-                                className={clsx(
-                                    "relative transition-all duration-200 cursor-grab active:cursor-grabbing",
-                                    isSelected ? "-translate-y-6 z-50 scale-110" : "hover:-translate-y-4 hover:z-40"
-                                )}
-                            >
-                                <Card
-                                    card={card}
-                                    selected={isSelected}
-                                    onClick={() => toggleSelect(card.id)}
-                                />
-                            </div>
-                        );
-                    })}
+                    <AnimatePresence initial={false}>
+                        {localHand.map((card, idx) => {
+                            const isSelected = selectedCards.includes(card.id);
+                            return (
+                                <motion.div
+                                    layout
+                                    key={card.id}
+                                    style={{ zIndex: idx }}
+                                    draggable
+                                    onDragStart={(e) => handleDragStart(e as any, idx, card.id)}
+                                    onDragEnter={(e) => handleDragEnter(e as any, idx)}
+                                    onDragEnd={handleDragEnd}
+                                    onDragOver={(e) => e.preventDefault()}
+                                    className={clsx(
+                                        "relative cursor-grab active:cursor-grabbing",
+                                        isSelected ? "z-50" : "hover:z-40"
+                                    )}
+                                    animate={{
+                                        y: isSelected ? -24 : 0,
+                                        scale: isSelected ? 1.1 : 1,
+                                    }}
+                                    whileHover={{ y: isSelected ? -24 : -16 }}
+                                    transition={{ type: "spring", stiffness: 300, damping: 25 }}
+                                >
+                                    <Card
+                                        card={card}
+                                        selected={isSelected}
+                                        onClick={() => toggleSelect(card.id)}
+                                    />
+                                </motion.div>
+                            );
+                        })}
+                    </AnimatePresence>
                 </div>
             </div>
 
-            {/* Turn Indicator Main - Moved to top left/right corner to be less intrusive */}
+            {/* Turn Indicator Main */}
             {me.isMyTurn && (
-                <div className="absolute top-4 right-4 animate-bounce">
-                    <div className="bg-yellow-500 text-black px-4 py-2 rounded-full font-bold shadow-lg border-2 border-white">
+                <motion.div
+                    initial={{ scale: 0 }}
+                    animate={{ scale: 1 }}
+                    className="absolute top-4 right-4"
+                >
+                    <div className="bg-yellow-500 text-black px-4 py-2 rounded-full font-bold shadow-lg border-2 border-white animate-pulse">
                         YOUR TURN
                     </div>
-                </div>
+                </motion.div>
             )}
         </div>
     );
