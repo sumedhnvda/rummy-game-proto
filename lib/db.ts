@@ -5,7 +5,7 @@ export const connectDB = async () => {
     if (mongoose.connection.readyState >= 1) return;
 
     try {
-        const URI = process.env.MONGO_URI;
+        const URI = process.env.MONGODB_URI;
         if (!URI) {
             console.warn("⚠️ MONGO_URI is missing in environment variables.");
             // Only fall back in dev/test, or throw in prod

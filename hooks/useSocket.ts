@@ -6,14 +6,10 @@ export const useSocket = () => {
     const [isConnected, setIsConnected] = useState(false);
 
     useEffect(() => {
-        // In dev: undefined (connects to same origin localhost:3000)
-        // In prod (Split): Vercel needs to point to Render URL
-        // In prod (Unified): undefined (connects to same origin)
-        const socketUrl = process.env.NEXT_PUBLIC_SOCKET_URL;
+        const socketUrl = process.env.NEXT_PUBLIC_SOCKET_URL || "http://localhost:3000";
 
         const socketInstance = io(socketUrl, {
-            path: "/socket.io", // Ensure path matches server default
-            transports: ["websocket", "polling"], // Enforce websocket preferred
+            transports: ["websocket", "polling"],
         });
 
         socketInstance.on("connect", () => {

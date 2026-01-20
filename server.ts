@@ -1,31 +1,33 @@
 import { config } from 'dotenv';
 config();
 
-import express, { Request, Response } from "express";
-import next from "next";
+import express from "express";
 import { Server } from "socket.io";
 import { createServer } from "http";
-import { parse } from "url";
 import { RoomManager } from "./socket/roomManager";
 import { connectDB } from "./lib/db";
+import cors from "cors";
 
-const dev = process.env.NODE_ENV !== "production";
-const hostname = "localhost";
+const hostname = "0.0.0.0"; // Bind to all interfaces for Render
 const port = parseInt(process.env.PORT || "3000", 10);
-// when using middleware `hostname` and `port` must be provided below
-const app = next({ dev, hostname, port });
-const handle = app.getRequestHandler();
 
-app.prepare().then(async () => {
+const startServer = async () => {
     // Connect to MongoDB
     await connectDB();
 
-    const server = express();
-    const httpServer = createServer(server);
+    const app = express();
+    app.use(cors());
+
+    // Health check endpoint for Render
+    app.get("/", (req, res) => {
+        res.send("Rummy Socket Server Running");
+    });
+
+    const httpServer = createServer(app);
 
     const io = new Server(httpServer, {
         cors: {
-            origin: "*", // Allow all for now, lock down in prod if Vercel URL known
+            origin: "*", // Allow all connections (frontend needs to connect)
             methods: ["GET", "POST"]
         }
     });
@@ -38,7 +40,7 @@ app.prepare().then(async () => {
         socket.on("create-room", async ({ playerName, maxPlayers }, callback) => {
             const roomId = await roomManager.createRoom(maxPlayers);
             await roomManager.joinRoom(socket, roomId, playerName);
-            callback(roomId);
+            if (callback) callback(roomId);
         });
 
         socket.on("join-queue", async ({ playerName, gameSize }) => {
@@ -75,17 +77,12 @@ app.prepare().then(async () => {
         });
     });
 
-    // Use middleware to handle all requests
-    server.use((req: Request, res: Response) => {
-        return handle(req, res);
+    httpServer.listen(port, hostname, () => {
+        console.log(`> Ready on http://${hostname}:${port}`);
     });
+};
 
-    httpServer
-        .once("error", (err) => {
-            console.error(err);
-            process.exit(1);
-        })
-        .listen(port, () => {
-            console.log(`> Ready on http://${hostname}:${port}`);
-        });
+startServer().catch(err => {
+    console.error(err);
+    process.exit(1);
 });
