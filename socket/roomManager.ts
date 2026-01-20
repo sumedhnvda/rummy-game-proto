@@ -101,7 +101,7 @@ export class RoomManager {
 
             const playersRaw = await redis.lpop<string[]>(queueKey, gameSize);
             if (playersRaw && playersRaw.length === gameSize) {
-                const players = playersRaw.map(s => JSON.parse(s));
+                const players = playersRaw.map(s => (typeof s === 'string' ? JSON.parse(s) : s));
                 const roomId = await this.createRoom(gameSize);
                 console.log(`Match managed via Upstash! Room ${roomId}`);
 
