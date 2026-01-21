@@ -4,7 +4,7 @@ import { GameState, Card as CardType } from "@/lib/game/types";
 import { Card } from "./Card";
 import { HowToPlayModal } from "./HowToPlayModal";
 import clsx from "clsx";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence, Reorder, useMotionValue } from "framer-motion";
 
 interface GameBoardProps {
     socket: Socket;
@@ -30,6 +30,9 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
     const [isRevealing, setIsRevealing] = useState(false);
     // FIX: Initialize with current hand length to prevent animation on first render
     const prevHandLength = useRef<number>(me ? me.hand.length : 0);
+
+    // Discard Pile Ref for Drop Detection
+    const discardPileRef = useRef<HTMLDivElement>(null);
 
     // Sync local hand with game state strictly when not dragging
     useEffect(() => {
@@ -111,6 +114,8 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
 
     const handleDraw = (fromDiscard: boolean) => {
         if (!me?.isMyTurn) return;
+        // Prevent drawing if already has 14 cards (should theoretically not happen if button hidden)
+        if (me.hand.length >= 14) return;
 
         // Optimistic Animation
         if (fromDiscard && gameState.discardPile.length > 0) {
@@ -125,48 +130,46 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
         socket.emit("draw-card", { roomId: gameState.roomId, fromDiscard });
     };
 
-    const handleDiscard = () => {
+    const handleDiscard = (cardId?: string) => {
+        const idToDiscard = cardId || selectedCards[0];
+
         if (!me?.isMyTurn) return;
-        if (selectedCards.length !== 1) {
+        if (!idToDiscard) {
             setActionError("Select exactly 1 card to discard");
             setTimeout(() => setActionError(""), 2000);
             return;
         }
-        socket.emit("discard-card", { roomId: gameState.roomId, cardId: selectedCards[0] });
+        socket.emit("discard-card", { roomId: gameState.roomId, cardId: idToDiscard });
         setSelectedCards([]);
     };
 
-    // --- Drag & Drop Logic ---
-    const dragItem = useRef<number | null>(null);
-    const dragOverItem = useRef<number | null>(null);
-
-    const handleDragStart = (e: React.DragEvent, position: number, cardId: string) => {
-        dragItem.current = position;
-        setIsDragging(true);
-        e.dataTransfer.setData("text/plain", cardId);
-        e.dataTransfer.effectAllowed = "move";
+    // --- Reorder & Drop Logic ---
+    const handleReorder = (newOrder: CardType[]) => {
+        setLocalHand(newOrder);
+        // Debounce emit or emit after delay could be added, but for now we emit on drag end of the item
     };
 
-    const handleDragEnter = (e: React.DragEvent, position: number) => {
-        dragOverItem.current = position;
-
-        if (dragItem.current !== null && dragItem.current !== dragOverItem.current) {
-            const newHand = [...localHand];
-            const draggedContent = newHand[dragItem.current];
-            newHand.splice(dragItem.current, 1);
-            newHand.splice(dragOverItem.current, 0, draggedContent);
-
-            dragItem.current = dragOverItem.current; // Update drag index to new spot
-            setLocalHand(newHand);
-        }
-    };
-
-    const handleDragEnd = () => {
+    // Called when a card drag ends. We check if it was dropped on the discard pile.
+    const onCardDragEnd = (event: MouseEvent | TouchEvent | PointerEvent, info: any, cardId: string) => {
         setIsDragging(false);
-        dragItem.current = null;
-        dragOverItem.current = null;
 
-        // Emit new order to server
+        // Check for drop on discard pile
+        if (discardPileRef.current && me?.isMyTurn && me.hand.length === 14) {
+            const discardRect = discardPileRef.current.getBoundingClientRect();
+            const dropPoint = info.point; // { x, y } absolute coordinates
+
+            if (
+                dropPoint.x >= discardRect.left &&
+                dropPoint.x <= discardRect.right &&
+                dropPoint.y >= discardRect.top &&
+                dropPoint.y <= discardRect.bottom
+            ) {
+                handleDiscard(cardId);
+                return; // Don't emit reorder if we discarded
+            }
+        }
+
+        // If not discarded, emit reorder
         if (me) {
             socket.emit("rearrange-hand", {
                 roomId: gameState.roomId,
@@ -175,7 +178,6 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
         }
     };
 
-
     if (!me) {
         return (
             <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-900 to-black text-white p-4">
@@ -183,7 +185,7 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
                     <div className="w-16 h-16 border-4 border-yellow-400 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
                     <h2 className="text-2xl font-bold mb-2">Connecting to Game...</h2>
                     <p className="text-gray-400 mb-8 max-w-md">
-                        We are syncing your game state. If this takes too long, your session might have expired.
+                        We are syncing your game state.
                     </p>
                     <button
                         onClick={() => window.location.reload()}
@@ -220,6 +222,19 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
     return (
         <div className="flex flex-col h-screen bg-green-800 p-4 text-white overflow-hidden relative">
             <HowToPlayModal />
+
+            {/* Landscape Warning Overlay */}
+            <div className="fixed inset-0 z-[100] bg-black flex flex-col items-center justify-center text-center p-8 landscape:hidden">
+                <div className="animate-spin mb-8">
+                    <svg className="w-16 h-16 text-yellow-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                </div>
+                <h2 className="text-3xl font-bold text-yellow-400 mb-4">Please Rotate Device</h2>
+                <p className="text-gray-400 max-w-sm">
+                    This game is designed for landscape mode. Please rotate your phone to play.
+                </p>
+            </div>
 
             <AnimatePresence>
                 {showDrawAnim && (
@@ -310,46 +325,37 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
                 </motion.div>
 
                 {/* Discard Pile */}
-                <motion.div
-                    whileHover={me.isMyTurn && me.hand.length === 13 && gameState.discardPile.length > 0 ? { scale: 1.1 } : {}}
-                    whileTap={me.isMyTurn && me.hand.length === 13 && gameState.discardPile.length > 0 ? { scale: 0.95 } : {}}
-                    onDragOver={(e) => {
-                        e.preventDefault();
-                        e.currentTarget.style.borderColor = "yellow"; // Basic visual feedback
-                    }}
-                    onDragLeave={(e) => {
-                        e.currentTarget.style.borderColor = "white";
-                    }}
-                    onDrop={(e) => {
-                        e.preventDefault();
-                        e.currentTarget.style.borderColor = "white";
-                        const cardId = e.dataTransfer.getData("text/plain");
-                        if (cardId && me.isMyTurn) {
-                            // If player drops a card here, they want to DISCARD it
-                            // Logic: emit discard
-                            socket.emit("discard-card", { roomId: gameState.roomId, cardId });
-                            setSelectedCards([]); // Clear selection
-                        }
-                    }}
-                    className={clsx("flex flex-col items-center gap-2 cursor-pointer transition-colors", me.isMyTurn && me.hand.length === 13 && gameState.discardPile.length > 0 && "ring-4 ring-red-400/50 rounded-xl")}
-                    onClick={() => handleDraw(true)}
+                <div
+                    ref={discardPileRef}
+                    className="relative" // Container for ref positioning
                 >
-                    <div className="w-24 h-36 border-2 border-dashed border-white/30 rounded-lg flex items-center justify-center relative bg-white/5 pointer-events-none">
-                        {gameState.discardPile.length > 0 ? (
-                            <div className="transform rotate-0">
-                                <Card
-                                    card={gameState.discardPile[gameState.discardPile.length - 1]}
-                                />
-                            </div>
-                        ) : (
-                            <span className="text-white/30 text-xs">Empty</span>
+                    <motion.div
+                        whileHover={me.isMyTurn && me.hand.length === 13 && gameState.discardPile.length > 0 ? { scale: 1.1 } : {}}
+                        whileTap={me.isMyTurn && me.hand.length === 13 && gameState.discardPile.length > 0 ? { scale: 0.95 } : {}}
+                        className={clsx(
+                            "flex flex-col items-center gap-2 cursor-pointer transition-colors",
+                            me.isMyTurn && me.hand.length === 13 && gameState.discardPile.length > 0 && "ring-4 ring-red-400/50 rounded-xl",
+                            // Visual cue when dragging over (can't easily do CSS hover for drag, but Reorder covers us visually)
                         )}
-                    </div>
-                    <span className="text-xs font-semibold tracking-widest text-white/70">DISCARD PILE</span>
-                    <span className="text-[10px] text-yellow-400/70 font-mono opacity-0 group-hover:opacity-100 transition-opacity">
-                        DROP HERE TO DISCARD
-                    </span>
-                </motion.div>
+                        onClick={() => handleDraw(true)}
+                    >
+                        <div className="w-24 h-36 border-2 border-dashed border-white/30 rounded-lg flex items-center justify-center relative bg-white/5 pointer-events-none">
+                            {gameState.discardPile.length > 0 ? (
+                                <div className="transform rotate-0">
+                                    <Card
+                                        card={gameState.discardPile[gameState.discardPile.length - 1]}
+                                    />
+                                </div>
+                            ) : (
+                                <span className="text-white/30 text-xs">Empty</span>
+                            )}
+                        </div>
+                        <span className="text-xs font-semibold tracking-widest text-white/70">DISCARD PILE</span>
+                        <span className="text-[10px] text-yellow-400/70 font-mono opacity-0 group-hover:opacity-100 transition-opacity">
+                            DROP HERE TO DISCARD
+                        </span>
+                    </motion.div>
+                </div>
             </div>
 
             {/* Bottom: My Hand */}
@@ -357,7 +363,7 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
                 <div className="flex justify-center mb-6 gap-4">
                     <button className="px-6 py-2 bg-blue-600/80 rounded-full hover:bg-blue-600 text-sm font-bold border border-blue-400 transition-colors">Group Selected</button>
                     <button
-                        onClick={handleDiscard}
+                        onClick={() => handleDiscard()}
                         disabled={!me.isMyTurn || selectedCards.length !== 1}
                         className={clsx(
                             "px-6 py-2 rounded-full text-sm font-bold border transition-colors flex items-center gap-2",
@@ -372,40 +378,59 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
                     <button className="px-6 py-2 bg-yellow-600/80 rounded-full hover:bg-yellow-600 text-sm font-bold border border-yellow-400 transition-colors">Declare</button>
                 </div>
 
-                <div className="relative h-48 flex justify-center items-end -space-x-8 pb-4 px-4 overflow-x-visible">
-                    <AnimatePresence initial={false}>
-                        {localHand.map((card, idx) => {
-                            const isSelected = selectedCards.includes(card.id);
-                            return (
-                                <motion.div
-                                    layout
-                                    key={card.id}
-                                    style={{ zIndex: idx }}
-                                    draggable
-                                    onDragStart={(e) => handleDragStart(e as any, idx, card.id)}
-                                    onDragEnter={(e) => handleDragEnter(e as any, idx)}
-                                    onDragEnd={handleDragEnd}
-                                    onDragOver={(e) => e.preventDefault()}
-                                    className={clsx(
-                                        "relative cursor-grab active:cursor-grabbing",
-                                        isSelected ? "z-50" : "hover:z-40"
-                                    )}
-                                    animate={{
-                                        y: isSelected ? -24 : 0,
-                                        scale: isSelected ? 1.1 : 1,
-                                    }}
-                                    whileHover={{ y: isSelected ? -24 : -16 }}
-                                    transition={{ type: "spring", stiffness: 300, damping: 25 }}
-                                >
-                                    <Card
-                                        card={card}
-                                        selected={isSelected}
-                                        onClick={() => toggleSelect(card.id)}
-                                    />
-                                </motion.div>
-                            );
-                        })}
-                    </AnimatePresence>
+                {/* Hand Area with Reorder */}
+                <div className="relative h-48 flex justify-center items-end pb-4 px-4 overflow-x-visible w-full">
+                    <Reorder.Group
+                        axis="x"
+                        values={localHand}
+                        onReorder={handleReorder}
+                        className="flex justify-center -space-x-8" // Negative space for overlap
+                    >
+                        <AnimatePresence initial={false}>
+                            {localHand.map((card) => {
+                                const isSelected = selectedCards.includes(card.id);
+                                return (
+                                    <Reorder.Item
+                                        key={card.id}
+                                        value={card}
+                                        onDragStart={() => setIsDragging(true)}
+                                        onDragEnd={(e, info) => onCardDragEnd(e, info, card.id)}
+                                        className={clsx(
+                                            "relative cursor-grab active:cursor-grabbing focus:outline-none touch-none", // touch-none for better mobile drag
+                                            isSelected ? "z-50" : "hover:z-40"
+                                        )}
+                                        // Framer Motion Styles
+                                        initial={{ opacity: 0, y: 50 }}
+                                        animate={{
+                                            opacity: 1,
+                                            y: isSelected ? -24 : 0,
+                                            scale: isSelected ? 1.1 : 1,
+                                            zIndex: isDragging ? 100 : (isSelected ? 50 : 0) // Boost Z on drag
+                                        }}
+                                        exit={{ opacity: 0, y: 50, transition: { duration: 0.2 } }}
+                                        whileDrag={{
+                                            scale: 1.2,
+                                            zIndex: 100,
+                                            boxShadow: "0px 10px 20px rgba(0,0,0,0.5)"
+                                        }}
+                                        transition={{ type: "spring", stiffness: 300, damping: 25 }}
+                                    >
+                                        <div
+                                            className="relative"
+                                            onClick={() => toggleSelect(card.id)}
+                                        >
+                                            <Card
+                                                card={card}
+                                                selected={isSelected}
+                                            // Remove onClick from Card if it consumes event, handled above
+                                            />
+                                            {/* Invisible overlay to ensuring click captures for selection if not dragging */}
+                                        </div>
+                                    </Reorder.Item>
+                                );
+                            })}
+                        </AnimatePresence>
+                    </Reorder.Group>
                 </div>
             </div>
 
@@ -424,3 +449,4 @@ export const GameBoard = ({ socket, gameState, playerId }: GameBoardProps) => {
         </div>
     );
 };
+
